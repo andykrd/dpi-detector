@@ -104,8 +104,7 @@ def classify_quality(
     if jitter_ms is not None:
         if jitter_ms > 500:
             issues.append(f"джиттер {jitter_ms:.0f}ms")
-            if severity == "ok":
-                severity = "warn"
+            severity = "bad"
         elif jitter_ms > 200:
             issues.append(f"джиттер {jitter_ms:.0f}ms")
             if severity == "ok":
