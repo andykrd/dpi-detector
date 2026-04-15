@@ -12,6 +12,12 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
+# Build
 dpi_detector.spec
 build/
 dist/
+
+# DPI Detector
+results/
+report_*.txt
+.tmp/
