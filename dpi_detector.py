@@ -21,7 +21,7 @@ except ImportError as e:
 from utils import config
 from cli.console import console
 from cli.ui import ask_test_selection, print_legend
-from cli.runners import run_domains_test, run_tcp_test, run_whitelist_sni_test, run_telegram_test
+from cli.runners import run_domains_test, run_tcp_test, run_whitelist_sni_test, run_telegram_test, run_latency_test
 from core.dns_scanner import check_dns_integrity, collect_stub_ips_silently
 from utils.files import load_domains, load_tcp_targets, load_whitelist_sni, get_base_dir
 
@@ -97,6 +97,7 @@ def _format_summary(
     run_dns: bool, run_domains: bool, run_tcp: bool, run_telegram: bool,
     dns_intercept: int, domain_stats, tcp_stats,
     telegram_stats=None,
+    latency_stats=None,
     doh_unavailable=False,
 ) -> List[str]:
     lines = []
@@ -187,6 +188,21 @@ def _format_summary(
         dc_color = "green" if dc_r == dc_t else ("red" if dc_r == 0 else "yellow")
         lines.append(f"[bold]{'TG Датацентры':<13}[/bold] [{dc_color}]ОК {dc_r}/{dc_t}[/{dc_color}]")
 
+    if latency_stats and latency_stats.get("total", 0) > 0:
+        l = latency_stats
+        ok_l = l.get("ok", 0)
+        warn_l = l.get("warn", 0)
+        bad_l = l.get("bad", 0)
+        total_l = l["total"]
+        line = f"[bold]TCP Latency[/bold]   "
+        if bad_l > 0:
+            line += f"[red]× {bad_l}/{total_l} плохо[/red]"
+        if warn_l > 0:
+            line += f"  [yellow]⚠ {warn_l}/{total_l} проблемы[/yellow]"
+        if ok_l > 0:
+            line += f"  [green]√ {ok_l}/{total_l} норма[/green]"
+        lines.append(line)
+
     return lines
 
 
@@ -206,7 +222,7 @@ async def main():
     args = parse_arguments()
 
     if args.proxy:
-        config.PROXY_URL = args.proxy
+        config.PROXY_URL = None if args.proxy.lower() == "null" else args.proxy
     if args.concurrency:
         config.MAX_CONCURRENT = args.concurrency
 
@@ -231,13 +247,14 @@ async def main():
     else:
         selection = await ask_test_selection()
 
-    run_dns     = "1" in selection
-    run_domains = "2" in selection
-    run_tcp     = "3" in selection
-    run_wl_sni  = "4" in selection
-    run_telegram = "5" in selection
-    run_legend  = "6" in selection
-    only_legend = run_legend and not any([run_dns, run_domains, run_tcp, run_wl_sni, run_telegram])
+    run_dns      = "1" in selection
+    run_domains  = "2" in selection
+    run_tcp      = "3" in selection
+    run_wl_sni   = "4" in selection
+    run_telegram  = "5" in selection
+    run_legend   = "6" in selection
+    run_latency  = "7" in selection
+    only_legend = run_legend and not any([run_dns, run_domains, run_tcp, run_wl_sni, run_telegram, run_latency])
 
     if only_legend:
         print_legend()
@@ -306,13 +323,19 @@ async def main():
         telegram_stats = None
         if run_telegram:
             telegram_stats = await run_telegram_test(semaphore)
+
+        # ── TCP Latency ─────────────────────────────────────────────────────────
+        latency_stats = None
+        if run_latency:
+            latency_stats = await run_latency_test(semaphore)
         # ── Итоговая сводка ───────────────────────────────────────────────────
-        active_tests = sum([run_dns, run_domains, run_tcp, run_wl_sni, run_telegram])
+        active_tests = sum([run_dns, run_domains, run_tcp, run_wl_sni, run_telegram, run_latency])
         console.print()
         summary_lines = _format_summary(
             run_dns, run_domains, run_tcp, run_telegram,
             dns_intercept_count, domain_stats, tcp_stats,
             telegram_stats=telegram_stats,
+            latency_stats=latency_stats,
             doh_unavailable=doh_unavailable,
         )
         console.print(Panel(

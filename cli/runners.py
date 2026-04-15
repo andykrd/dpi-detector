@@ -14,6 +14,7 @@ from cli.ui import clean_hostname, build_domain_row
 from core.tls_scanner import check_domain_tls, check_http_injection, create_dpi_client
 from core.tcp16_scanner import check_tcp_16_20, check_tcp_16_20_with_rtt
 from core.telegram_scanner import run_telegram_test as _run_telegram_test
+from core.latency_scanner import probe_target, _fmt_ms, _fmt_ms_f1
 from utils.network import get_resolved_ip
 
 
@@ -38,6 +39,7 @@ async def _resolve_worker(domain_raw: str, semaphore: asyncio.Semaphore, stub_ip
         "domain":       domain,
         "resolved_ipv4": resolved_ipv4,
         "dns_fake":     False,
+        "ip_blocked":   False,
         "t13v4_res":    ("[dim]—[/dim]", "", 0.0),
         "t12_res":      ("[dim]—[/dim]", "", 0.0),
         "http_res":     ("[dim]—[/dim]", ""),
@@ -58,6 +60,26 @@ async def _resolve_worker(domain_raw: str, semaphore: asyncio.Semaphore, stub_ip
         entry["t12_res"]   = (fake, detail, 0.0)
         entry["http_res"]  = (fake, detail)
         entry["dns_fake"]  = True
+        return entry
+
+    # TCP pre-check: быстрая проверка доступности IP по порту 443
+    # Пропускаем если настроен прокси — трафик пойдёт через него, прямой TCP не показателен
+    if not getattr(config, "PROXY_URL", None):
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(resolved_ipv4, 443),
+                timeout=3.0
+            )
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            blocked = "[bold red]IP BLOCKED[/bold red]"
+            detail = f"TCP connect к {resolved_ipv4}:443 недоступен"
+            entry["t13v4_res"] = (blocked, detail, 0.0)
+            entry["t12_res"]   = (blocked, detail, 0.0)
+            entry["http_res"]  = (blocked, detail)
+            entry["ip_blocked"] = True
+            return entry
 
     return entry
 
@@ -70,7 +92,7 @@ async def _tls_worker(
     stub_ips: set = None,
 ) -> None:
     """Фаза TLS: пишет результат в entry in-place."""
-    if entry["dns_fake"] is not False:
+    if entry["dns_fake"] is not False or entry.get("ip_blocked"):
         return
     try:
         result = await check_domain_tls(
@@ -89,7 +111,7 @@ async def _http_worker(
     stub_ips: set = None,
 ) -> None:
     """Фаза HTTP: пишет результат в entry in-place."""
-    if entry["dns_fake"] is not False:
+    if entry["dns_fake"] is not False or entry.get("ip_blocked"):
         return
     async with semaphore:
         try:
@@ -161,7 +183,7 @@ async def run_domains_test(semaphore: asyncio.Semaphore, stub_ips: set, domains:
     # Фаза 0: DNS-резолв
     entries = await _run_with_progress(
         [_resolve_worker(d, semaphore, stub_ips) for d in domains],
-        "Фаза 0/3: DNS-резолв..."
+        "Фаза 0/3: DNS + TCP pre-check..."
     )
 
     client_t13 = create_dpi_client("TLSv1.3")
@@ -503,3 +525,122 @@ async def run_whitelist_sni_test(semaphore: asyncio.Semaphore, tcp_items: list, 
 async def run_telegram_test(semaphore: asyncio.Semaphore) -> dict:
     from core.telegram_scanner import run_telegram_test as _run_scanner
     return await _run_scanner(semaphore)
+
+
+# ── Тест 7: TCP Latency ──────────────────────────────────────────────────────
+
+async def run_latency_test(semaphore: asyncio.Semaphore) -> dict:
+    """Тест 7: TCP Latency — серия tcping-проб для измерения качества соединения."""
+    targets = getattr(config, "LATENCY_TARGETS", [])
+    if not targets:
+        console.print("[yellow]LATENCY_TARGETS не задан в config.yml — тест 7 пропущен.[/yellow]")
+        return {"total": 0, "ok": 0, "warn": 0, "bad": 0}
+
+    probe_count = getattr(config, "LATENCY_PROBE_COUNT", 20)
+    probe_timeout = getattr(config, "LATENCY_PROBE_TIMEOUT", 5.0)
+    probe_interval = getattr(config, "LATENCY_PROBE_INTERVAL", 0.5)
+
+    console.print(
+        f"\n[bold]TCP Latency тест[/bold]  "
+        f"[dim]Целей: {len(targets)} | проб: {probe_count} | "
+        f"timeout: {probe_timeout}s | интервал: {probe_interval}s[/dim]\n"
+    )
+
+    async def _latency_worker(target: list) -> dict:
+        ip = target[0]
+        port = int(target[1])
+        label = target[2] if len(target) > 2 else f"{ip}:{port}"
+        result = await probe_target(
+            ip, port,
+            count=probe_count,
+            timeout=probe_timeout,
+            interval=probe_interval,
+            semaphore=semaphore,
+        )
+        result["label"] = label
+        return result
+
+    results = await _run_with_progress(
+        [_latency_worker(t) for t in targets],
+        "Пробирование..."
+    )
+
+    # Таблица результатов
+    table = Table(show_header=True, header_style="bold magenta", border_style="dim")
+    table.add_column("Цель",       style="cyan", no_wrap=True)
+    table.add_column("IP:порт",    style="dim", no_wrap=True)
+    table.add_column("Качество",   justify="center")
+    table.add_column("Потери",     justify="center")
+    table.add_column("P50",        justify="right")
+    table.add_column("P95",        justify="right")
+    table.add_column("Max",        justify="right")
+    table.add_column("Джиттер",    justify="right")
+    table.add_column("Диагноз",    style="dim", no_wrap=True)
+
+    ok_count = warn_count = bad_count = 0
+
+    for r in results:
+        loss_str = f"{r['loss_pct']:.0f}%" if r['loss_pct'] > 0 else "[green]0%[/green]"
+        if r['loss_pct'] >= 5:
+            loss_str = f"[red]{r['loss_pct']:.0f}%[/red]"
+        elif r['loss_pct'] > 0:
+            loss_str = f"[yellow]{r['loss_pct']:.1f}%[/yellow]"
+
+        p50_str = f"{r['p50']:.0f}ms" if r['p50'] is not None else "—"
+        p95_str = f"{r['p95']:.0f}ms" if r['p95'] is not None else "—"
+        max_str = f"{r['max']:.0f}ms" if r['max'] is not None else "—"
+        jitter_str = f"{r['jitter']:.0f}ms" if r['jitter'] is not None else "—"
+
+        # Color latency values
+        if r['p50'] is not None:
+            if r['p50'] > 500:
+                p50_str = f"[red]{p50_str}[/red]"
+            elif r['p50'] > 200:
+                p50_str = f"[yellow]{p50_str}[/yellow]"
+            else:
+                p50_str = f"[green]{p50_str}[/green]"
+
+        if r['p95'] is not None:
+            if r['p95'] > 1000:
+                p95_str = f"[red]{p95_str}[/red]"
+            elif r['p95'] > 500:
+                p95_str = f"[yellow]{p95_str}[/yellow]"
+
+        if r['max'] is not None:
+            if r['max'] > 2000:
+                max_str = f"[red]{max_str}[/red]"
+            elif r['max'] > 1000:
+                max_str = f"[yellow]{max_str}[/yellow]"
+
+        table.add_row(
+            r["label"],
+            f"{r['ip']}:{r['port']}",
+            r["quality_label"],
+            loss_str,
+            p50_str,
+            p95_str,
+            max_str,
+            jitter_str,
+            r["diagnosis"],
+        )
+
+        if "ПЛОХО" in r["quality_label"]:
+            bad_count += 1
+        elif "ПРОБЛЕМЫ" in r["quality_label"]:
+            warn_count += 1
+        else:
+            ok_count += 1
+
+    console.print(table)
+
+    # Диагностика
+    if bad_count > 0 or warn_count > 0:
+        console.print()
+        if bad_count > 0:
+            console.print("[bold red][!] Обнаружены серьёзные проблемы с качеством соединения[/bold red]")
+            console.print("[dim]Возможные причины: DPI throttling, плохой роутинг, перегрузка хостера[/dim]")
+        if warn_count > 0:
+            console.print("[bold yellow][!] Некоторые цели имеют нестабильное соединение[/bold yellow]")
+            console.print("[dim]Проверьте: не меняется ли качество в разное время суток[/dim]")
+
+    return {"total": len(results), "ok": ok_count, "warn": warn_count, "bad": bad_count}

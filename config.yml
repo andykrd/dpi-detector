@@ -10,7 +10,7 @@ MAX_CONCURRENT: 100
 # В формате "протокол://ip:порт" или "протокол://user:pass@ip:port"
 # Примеры: "http://127.0.0.1:8080", "socks5://admin:password@1.2.3.4:1080"
 # Если прокси не нужен — null
-PROXY_URL: null
+PROXY_URL: "socks5://127.0.0.1:10808"
 
 # === Таймауты (в секундах) ===
 # Время ожидания установки TCP-соединения
@@ -53,9 +53,9 @@ DNS_CHECK_DOMAINS:
   - "shikimori.one"
   - "www.fastmail.com"
   # Доп домены:
-  # - "www.youtube.com"
-  # - "youtube.com"
-  # - "m.youtube.com"
+  - "www.youtube.com"
+  - "youtube.com"
+  - "m.youtube.com"
   # - "limetorrents.pro"
   # - "www.whatsapp.com"
   # - "newtime.ua",
@@ -84,3 +84,20 @@ DNS_DOH_SERVERS:
   - ["https://one.one.one.one/dns-query", "Cloudflare"]
   - ["https://dns.adguard-dns.com/resolve", "AdGuard"]
   - ["https://dns.alidns.com/resolve", "Alibaba"]
+
+# === Настройки теста TCP Latency (тест 7) ===
+# Количество TCP-проб на одну цель (больше = точнее, но дольше)
+LATENCY_PROBE_COUNT: 50
+# Таймаут одной TCP-пробы (секунды)
+LATENCY_PROBE_TIMEOUT: 5.0
+# Интервал между пробами (секунды)
+LATENCY_PROBE_INTERVAL: 1.0
+# Список целей для теста: [ip, порт, описание]
+LATENCY_TARGETS:
+  - ["94.131.100.174", 50033, "VLESS TCP Moscow"]
+  - ["94.131.100.174", 10088, "VLESS XHTTP Finland"]
+  - ["94.131.100.174", 50005, "VLESS Moscow 50005"]
+  - ["95.143.177.114", 10000, "VLESS Finland 10000"]
+  - ["88.218.69.95", 32443, "VLESS Kazakhstan"]
+  # Добавьте свои цели:
+  # - ["1.2.3.4", 443, "Мой сервер"]
